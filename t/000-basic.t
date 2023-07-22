@@ -3,12 +3,13 @@
 use v5.36;
 no warnings 'once';
 
+use Data::Dumper;
+
 use Test::More;
 use Test::Exception;
 use Test::Differences;
 
 use ok 'Paskell', qw[ :core :types :typeclasses ];
-
 
 type *X => *Num;
 type *Y => *Num;

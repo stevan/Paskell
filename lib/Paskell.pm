@@ -25,13 +25,12 @@ use constant DEBUG => $ENV{TYPES_DEBUG} || 0;
 # Setup the Core Types
 # -----------------------------------------------------------------------------
 
-my @PERL_TYPES = (
+my @CORE_TYPES = (
     *Any,      # any value
     *Scalar,   # a defined value
 
     *Undef,    # undef value
     *Bool,     # 1, 0 or ''
-    *Char,     # single character
     *Str,      # pretty much anything
     *Num,      # any numeric value
     *Int,      # if it looks like a number and int($_) == $_
@@ -40,22 +39,15 @@ my @PERL_TYPES = (
     *ArrayRef, # an ARRAY reference
     *HashRef,  # a HASH reference
 
-    # NOT SERIALIZABLE:
-
     *CodeRef,  # a CODE reference
-
-    # TODO: we need an object type
-    # *Blessed is too simple, but might
-    # work for now, but then again it
-    # should be serializable, so maybe
-    # this is just a bad idea
+    *GlobRef,  # a GLOB reference
 );
 
 # -----------------------------------------------------------------------------
 # Collect types
 # -----------------------------------------------------------------------------
 
-my @ALL_TYPES      = @PERL_TYPES;
+my @ALL_TYPES      = @CORE_TYPES;
 my @ALL_TYPE_NAMES = map   get_type_name($_),      @ALL_TYPES;
 my @ALL_TYPE_GLOBS = map   '*'.$_,                 @ALL_TYPE_NAMES;
 my %ALL_TYPES      = map { get_type_name($_), $_ } @ALL_TYPES;
@@ -94,7 +86,7 @@ our %EXPORT_TAGS = (
 );
 
 # -----------------------------------------------------------------------------
-# Type Checkers (INTERNAL USE ONLY)
+# Type Checkers
 # -----------------------------------------------------------------------------
 
 sub match ($target, $table) {
@@ -104,37 +96,16 @@ sub match ($target, $table) {
     if ( my $type_checker = lookup_type( $type ) ) {
         warn "Checking $type against $type_checker" if DEBUG;
 
-        # TODO - turn conditionals into polymorphic method calls
-        #
-        # NOTE:
-        # they can be just deconstructable, like event
-        # or deconstructable and bounds checkable, like tagged unions
-        # or just bounds checkable, like enums
-        #
-        # bounds checks should be memoized, so we dont
-        # have to do them every time match is called
-
-        if ( $type_checker isa Paskell::Type::Event::Protocol ) {
-
-            my ($msg) = @args;
-            $type_checker->check( $msg )
-                or confess "Event::Protocol($type) failed to type check msg(".(join ', ' => @$msg).")";
-
-            my ($event, @_args) = @$msg;
-            $match = $table->{ $event }
-                or confess "Unable to find match for Event::Protocol($type) with event($event)";
-            # fixup the args ...
-            @args = @_args;
-
-        }
-        elsif ( $type_checker isa Paskell::Type::TaggedUnion ) {
+        if ( $type_checker isa Paskell::Type::TaggedUnion ) {
             my ($arg) = @args;
             $type_checker->check( $arg )
                 or confess "TaggedUnion::Constructor($type) failed to type check instance of ($arg)";
+
             # TODO: check the members of table as well
             my $tag = $type_checker->cases->{ blessed( $arg ) }->symbol;
             $match = $table->{ $tag }
                 or confess "Unable to find match for TaggedUnion::Constructor($type) with tag($tag)";
+
             # deconstruct the args now ...
             @args = @$arg;
         }
@@ -142,9 +113,11 @@ sub match ($target, $table) {
             my ($enum_val) = @args;
             $type_checker->check( $enum_val )
                 or confess "Enum($type) failed to type check instance of ($enum_val)";
+
             # TODO: check the members of table as well
             $match = $table->{ $enum_val }
                 or confess "Unable to find match for Enum($type) with value($enum_val)";
+
             # clear the args now ...
             @args = ();
         }
@@ -225,8 +198,10 @@ sub typeclass ($t, $body) {
 
         my %cases  = $type->cases->%*;
 
-        $method = sub ($name, $table) {
+        $method = sub ($name, $table, @rest) {
 
+            # If we get a CODE ref, then we install it
+            # in all the classes in the union
             if ( ref $table eq 'CODE' ) {
                 foreach my $constructor_symbol ( keys %cases ) {
                     no strict 'refs';
@@ -236,7 +211,17 @@ sub typeclass ($t, $body) {
                     );
                 }
             }
-            elsif ( ref $table eq 'HASH' ) {
+            # If we get a HASH ref, then we loop over
+            # the keys (the classes in the union) and
+            # install each method variant accordingly
+            elsif ( ref $table eq 'HASH' || ref $table eq 'ARRAY' ) {
+
+                my $has_args;
+                if (ref $table eq 'ARRAY') {
+                    $has_args = $table;
+                    $table = $rest[0];
+                }
+
                 foreach my $type_name ( keys %$table ) {
                     my $constructor_symbol = "${symbol}::${type_name}";
                        $constructor_symbol =~ s/main//;
@@ -251,6 +236,12 @@ sub typeclass ($t, $body) {
 
                     my $handler = $table->{$type_name};
 
+                    # If do not get a CODE ref value, then we
+                    # expect it to be a GLOB ref that refers to
+                    # one of the elements in the particular
+                    # classes constructor definition. It will
+                    # look this up and create an appropriate
+                    # method for accessing it
                     if (ref $handler ne 'CODE') {
                         my @definitions = $constructor->definition;
 
@@ -266,10 +257,25 @@ sub typeclass ($t, $body) {
                         # encapsulation ;)
                         $body = sub ($_t) { $_t->[$i] };
                     }
+                    # otherwise it is a method, and we can just
+                    # make a small wrapper around it to do the
+                    # destructuring
                     else {
                         set_subname( "${constructor_symbol}::${name}" => $handler );
 
-                        $body = sub ($_t) { $handler->( @$_t ) }
+                        if ( $has_args ) {
+                            my $arg_types = resolve_types( $has_args );
+                            $body = sub ($_t, @args) {
+                                check_types( $arg_types, \@args )
+                                    || confess "Typecheck failed for $constructor_symbol with ("
+                                                .(join ', ' => map $_//'undef', @args).') expected('
+                                                .(join ', ' => map $_, @$has_args).')';
+                                $handler->( $_t, @args )
+                            };
+                        }
+                        else {
+                            $body = sub ($_t) { $handler->( @$_t ) };
+                        }
                     }
 
                     no strict 'refs';
@@ -280,6 +286,10 @@ sub typeclass ($t, $body) {
                     );
                 }
             }
+            # if we get a GLOB ref, then we loop through
+            # all the varients, locate the type specified
+            # by the GLOB and install accessor methods
+            # accordingly
             elsif ( ref((my $x = \$table)) eq 'GLOB' ) {
 
                 foreach my $constructor_symbol ( keys %cases ) {
@@ -320,6 +330,12 @@ sub typeclass ($t, $body) {
            $constructor_symbol =~ s/main//;
 
         my @definitions = $type->definition;
+
+        # This is easier, if it gets a CODE ref
+        # then it installs it, otherwise it
+        # should be a GLOB ref and then we look
+        # for the type definition and build the
+        # method accordingly
 
         $method = sub ($name, $body) {
             no strict 'refs';
@@ -700,6 +716,11 @@ type *HashRef, sub ($hash_ref) {
 type *CodeRef, sub ($code_ref) {
     return defined($code_ref)                   # it is defined ...
         && ref($code_ref) eq 'CODE'             # and it is a CODE reference
+};
+
+type *GlobRef, sub ($glob_ref) {
+    return defined($glob_ref)                   # it is defined ...
+        && ref($glob_ref) eq 'GLOB'             # and it is a GLOB reference
 };
 
 # -----------------------------------------------------------------------------
